@@ -1,0 +1,32 @@
+{
+  "name": "collab-doc-gateway",
+  "version": "1.0.0",
+  "description": "Server-side collaborative document gateway: Fastify + WebSocket + Yjs, PostgreSQL-backed update log and compacted snapshots.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "db:schema": "psql -h \"${PGHOST:-/tmp}\" -p \"${PGPORT:-55432}\" -U \"${PGUSER:-collab}\" -d \"${PGDATABASE:-collab}\" -v ON_ERROR_STOP=1 -f db/schema.sql",
+    "seed": "node scripts/seed.js",
+    "seed:reset": "node scripts/seed.js --reset",
+    "demo:a": "node scripts/client-a.js",
+    "demo:b": "node scripts/client-b.js",
+    "test": "node test/run-tests.js"
+  },
+  "keywords": [
+    "yjs",
+    "crdt",
+    "collaboration",
+    "fastify",
+    "websocket",
+    "postgresql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/websocket": "^10.0.1",
+    "fastify": "^4.29.1",
+    "pg": "^8.23.0",
+    "ws": "^8.22.0",
+    "yjs": "^13.6.33"
+  }
+}
