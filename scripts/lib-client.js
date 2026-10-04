@@ -6,20 +6,20 @@
 
 const WebSocket = require('ws');
 const Y = require('yjs');
-const crypto = require('node:crypto');
-
-function newMsgId() {
-  return crypto.randomBytes(8).toString('hex');
-}
+const { LocalOutbox, newMsgId } = require('./outbox');
 
 class DocClient {
-  constructor({ url, token, docId, name, autoApply = true, verbose = false }) {
+  constructor({
+    url, token, docId, name, autoApply = true, verbose = false,
+    outboxDir = null, autoDrainOutbox = true,
+  } = {}) {
     this.url = url;
     this.token = token;
     this.docId = docId;
     this.name = name || token;
     this.autoApply = autoApply;
     this.verbose = verbose;
+    this.autoDrainOutbox = autoDrainOutbox;
 
     this.doc = new Y.Doc({ gc: false });
     this.ws = null;
@@ -28,8 +28,22 @@ class DocClient {
     this.helloDone = false;
     this.role = null;
 
+    // Optional durable offline outbox. When enabled, local edits are
+    // persisted (document state + stable msgId + bytes) before being sent,
+    // and are only removed on a successful ack. A restart restores the
+    // local document and outstanding items from disk.
+    this.outbox = outboxDir
+      ? new LocalOutbox({ dir: outboxDir, token, docId })
+      : null;
+    this.restored = false;
+    if (this.outbox) {
+      this.restored = this.outbox.restoreInto(this.doc);
+    }
+    this._drainPromise = null;
+
     this.pending = new Map(); // msgId -> { resolve, reject, timer, bytes }
     this.updateQueue = [];   // locally generated, unflushed updates (b64)
+    this._queueMsgIds = [];  // aligned with updateQueue when using the outbox
     this.pendingUpdates = []; // received but not auto-applied (raw bytes)
     this.serverSv = null;
     this.acks = 0;
@@ -68,6 +82,7 @@ class DocClient {
       ws.on('close', () => {
         this.connected = false;
         this.helloDone = false;
+        this._failAllPending('DISCONNECTED', 'connection closed before ack');
         if (this._helloReject) {
           const e = this._helloReject;
           this._helloReject = null;
@@ -78,7 +93,14 @@ class DocClient {
       ws.on('open', () => {
         this.connected = true;
         const hello = { type: 'hello', token: this.token, docId: this.docId };
-        if (sv) hello.sv = sv.toString('base64');
+        // Explicit sv wins; a process restarted with a restored outbox next
+        // presents its existing state vector by default (offline gap repair),
+        // instead of forcing a full snapshot.
+        let helloSv = sv;
+        if (!helloSv && this.outbox && this.restored) {
+          helloSv = Y.encodeStateVector(this.doc);
+        }
+        if (helloSv) hello.sv = Buffer.from(helloSv).toString('base64');
         ws.send(JSON.stringify(hello));
       });
       ws.on('message', (data) => this._onMessage(data, done, () => {}));
@@ -112,8 +134,14 @@ class DocClient {
         } else if (state.length) {
           this.pendingUpdates.push(state);
         }
+        // The state-vector hello has repaired the offline gap; remember the
+        // merged local state, then resend the outbox in saved order.
+        if (this.outbox && state.length && this.autoApply) this.outbox.saveDocState(this.doc);
         connected();
         this.emit('hello', msg);
+        if (this.autoDrainOutbox) {
+          setImmediate(() => { this.drainOutbox().catch(() => {}); });
+        }
         resolveHello(msg);
         break;
       }
@@ -134,12 +162,19 @@ class DocClient {
           this.acks += 1;
           if (msg.duplicated) this.dupAcks += 1;
           this.seq = Math.max(this.seq, msg.seq || 0);
+          // Durable boundary reached: the server committed (possibly via a
+          // dedup hit). Only now may the outbox entry be dropped.
+          if (this.outbox) this.outbox.markAcked(msg.msgId);
           if (p) {
             clearTimeout(p.timer);
             this.pending.delete(msg.msgId);
             p.resolve(msg);
           }
         } else {
+          // Negative ack: keep the outbox item, stamped with the server's
+          // error (READ_ONLY / FORBIDDEN / CORRUPT_UPDATE / ...). It must
+          // remain visible instead of being silently discarded.
+          if (this.outbox) this.outbox.markFailed(msg.msgId, msg.code, msg.message);
           if (p) {
             clearTimeout(p.timer);
             this.pending.delete(msg.msgId);
@@ -156,16 +191,24 @@ class DocClient {
         this.receivedUpdates += 1;
         this.seq = Math.max(this.seq, msg.seq || 0);
         const bytes = Buffer.from(msg.update, 'base64');
-        if (this.autoApply) Y.applyUpdate(this.doc, new Uint8Array(bytes), 'remote');
-        else this.pendingUpdates.push(bytes);
+        if (this.autoApply) {
+          Y.applyUpdate(this.doc, new Uint8Array(bytes), 'remote');
+          if (this.outbox) this.outbox.saveDocState(this.doc);
+        } else {
+          this.pendingUpdates.push(bytes);
+        }
         this.emit('update', msg);
         break;
       }
       case 'sync-diff': {
         const bytes = Buffer.from(msg.update, 'base64');
         if (bytes.length) {
-          if (this.autoApply) Y.applyUpdate(this.doc, new Uint8Array(bytes), 'sync');
-          else this.pendingUpdates.push(bytes);
+          if (this.autoApply) {
+            Y.applyUpdate(this.doc, new Uint8Array(bytes), 'sync');
+            if (this.outbox) this.outbox.saveDocState(this.doc);
+          } else {
+            this.pendingUpdates.push(bytes);
+          }
         }
         this.seq = Math.max(this.seq, msg.seq || 0);
         this.emit('sync-diff', msg);
@@ -195,20 +238,48 @@ class DocClient {
     } finally {
       this.doc.off('update', handler);
     }
-    if (updateB64) this.updateQueue.push(updateB64);
+    if (updateB64) {
+      // Persist BEFORE anything is sent: a hard exit after this point still
+      // leaves both the merged document state and the update on disk.
+      if (this.outbox) {
+        const item = this.outbox.add(updateB64);
+        this._queueMsgIds.push(item.msgId);
+        this.outbox.saveDocState(this.doc);
+      }
+      this.updateQueue.push(updateB64);
+    }
     return updateB64;
   }
 
-  queueUpdate(updateB64) {
+  queueUpdate(updateB64, msgId) {
     this.updateQueue.push(updateB64);
+    if (this.outbox) {
+      const id = msgId || newMsgId();
+      this.outbox.add(updateB64, id);
+      this._queueMsgIds.push(id);
+      this.outbox.saveDocState(this.doc);
+    }
   }
 
   // Flush queued updates with a deterministic ordering function.
   // orderFn(queue) returns the sequence of b64 strings to send.
+  // With an outbox, each queued update already owns a stable msgId and a
+  // durable record; orderFn is ignored there (saved order is the order).
   async flush({ orderFn = null, concurrent = false, timeoutMs = 5000 } = {}) {
-    const items = orderFn ? orderFn(this.updateQueue) : this.updateQueue.slice();
-    this.updateQueue = [];
-    const sends = items.map((b64) => () => this.sendUpdate(b64, timeoutMs));
+    let items;
+    if (this.outbox) {
+      items = this.updateQueue.map((b64, i) => ({
+        b64,
+        msgId: this._queueMsgIds[i],
+      }));
+      this.updateQueue = [];
+      this._queueMsgIds = [];
+    } else {
+      const picked = orderFn ? orderFn(this.updateQueue) : this.updateQueue.slice();
+      this.updateQueue = [];
+      items = picked.map((b64) => ({ b64, msgId: undefined }));
+    }
+    const sends = items.map(({ b64, msgId }) => () => this.sendUpdate(b64, timeoutMs, msgId));
     if (concurrent) {
       // Fire all writes without waiting: tests use this to race the server.
       return Promise.all(sends.map((s) => s()));
@@ -219,15 +290,81 @@ class DocClient {
   }
 
   sendUpdate(updateB64, timeoutMs = 5000, msgId = newMsgId()) {
+    if (this.outbox) {
+      // Re-attach to the durable record (created in localEdit), or create one
+      // for bytes produced outside localEdit. The same msgId is what makes a
+      // post-restart replay dedup on the server.
+      if (!this.outbox.get(msgId)) this.outbox.add(updateB64, msgId);
+      this.outbox.markPending(msgId);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(msgId);
+        if (this.outbox) this.outbox.markFailed(msgId, 'ACK_TIMEOUT', 'no ack before timeout');
         reject(new Error('ack timeout'));
       }, timeoutMs);
       this.pending.set(msgId, { resolve, reject, timer, bytes: updateB64 });
       this.ws.send(JSON.stringify({ type: 'update', msgId, update: updateB64 }));
+      if (this.outbox) this.outbox.markAttempt(msgId);
       this.log('send update', msgId);
     });
+  }
+
+  // After a state-vector reconnect has repaired the offline gap, resend all
+  // outstanding outbox entries in saved order. One failure must not block
+  // the rest: server nacks are recorded on the item and iteration continues.
+  // Runs at most once at a time; concurrent callers join the same run.
+  drainOutbox({ timeoutMs = 5000 } = {}) {
+    if (!this.outbox) return Promise.resolve({ sent: 0, acked: 0, duplicated: 0, failed: 0, results: [] });
+    if (this._drainPromise) return this._drainPromise;
+    this._drainPromise = (async () => {
+      const report = { sent: 0, acked: 0, duplicated: 0, failed: 0, results: [] };
+      if (!this.helloDone || !this.ws || this.ws.readyState !== this.ws.OPEN) {
+        return report;
+      }
+      // Snapshot once: acks/errors mutate this.outbox.items while we iterate.
+      for (const item of this.outbox.outstanding()) {
+        if (!this.helloDone || this.ws.readyState !== this.ws.OPEN) break;
+        // Already in flight (e.g. a concurrent flush using the same msgId):
+        // never put a duplicate frame on the wire from this process.
+        if (this.pending.has(item.msgId)) continue;
+        report.sent += 1;
+        this.outbox.markPending(item.msgId);
+        try {
+          const ack = await this.sendUpdate(item.update, timeoutMs, item.msgId);
+          report.acked += 1;
+          if (ack.duplicated) report.duplicated += 1;
+          report.results.push({ msgId: item.msgId, ok: true, duplicated: !!ack.duplicated, seq: ack.seq });
+        } catch (e) {
+          // sendUpdate already stamped the durable item with the error code.
+          report.failed += 1;
+          report.results.push({
+            msgId: item.msgId, ok: false,
+            code: e.code || 'SEND_FAILED', message: e.message,
+          });
+        }
+      }
+      return report;
+    })().finally(() => { this._drainPromise = null; });
+    return this._drainPromise;
+  }
+
+  outboxSummary() {
+    return this.outbox ? this.outbox.summary() : null;
+  }
+
+  // Reject every in-flight send promise on disconnect/teardown. Durable
+  // items are marked failed (kept on disk, not deleted) so they are retried
+  // after the next reconnect.
+  _failAllPending(code, message) {
+    for (const [msgId, p] of this.pending.entries()) {
+      clearTimeout(p.timer);
+      if (this.outbox) this.outbox.markFailed(msgId, code, message);
+      const e = new Error(`${code}: ${message}`);
+      e.code = code;
+      p.reject(e);
+    }
+    this.pending.clear();
   }
 
   // Re-send an exact duplicate frame (same msgId + bytes), proving dedup.
@@ -252,9 +389,8 @@ class DocClient {
   }
 
   hardClose() {
-    for (const p of this.pending.values()) clearTimeout(p.timer);
-    this.pending.clear();
-    try { this.ws.terminate(); } catch { this.ws.close(); }
+    this._failAllPending('DISCONNECTED', 'hard close before ack');
+    try { this.ws && this.ws.terminate(); } catch { try { this.ws && this.ws.close(); } catch {} }
   }
 
   // For tests: send arbitrary raw frame text (corruption / protocol abuse).
@@ -300,8 +436,7 @@ class DocClient {
   }
 
   close() {
-    for (const p of this.pending.values()) clearTimeout(p.timer);
-    this.pending.clear();
+    this._failAllPending('CLOSED', 'client closed before ack');
     if (this.ws) this.ws.close();
   }
 }

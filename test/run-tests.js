@@ -690,13 +690,190 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 local offline outbox: offline edits, reconnect merge, crash-before-ack
+// ---------------------------------------------------------------------------
+const t11 = test('T11 local outbox restores offline edits, merges on reconnect and dedups an unacked resend to one server row', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { keyFor } = require('../scripts/outbox');
+  await createDoc('t11', { writers: ['user-alice', 'user-bob'] });
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'outbox-t11-'));
+  const boxFile = path.join(dir, keyFor('user-alice', 't11'));
+  const mkA = () => new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11', outboxDir: dir });
+
+  // (1) A edits completely OFFLINE (no server contact); outbox persists the
+  // document state plus one stable-msgId item.
+  const aOffline = mkA();
+  assert.ok(!fs.existsSync(boxFile), 'no outbox before first edit');
+  aOffline.localEdit((t) => t.insert(0, 'A-offline'));
+  assert.ok(fs.existsSync(boxFile), 'outbox file created before any send');
+  const box1 = JSON.parse(fs.readFileSync(boxFile, 'utf8'));
+  assert.equal(box1.items.length, 1);
+  assert.equal(box1.items[0].status, 'pending');
+  const offlineMsgId = box1.items[0].msgId;
+  assert.ok(box1.stateB64.length > 0, 'local document state persisted');
+
+  // (2) While A is away, B edits online.
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  await b.connect();
+  b.localEdit((t) => t.insert(t.length, 'B-online'));
+  await b.flush();
+  await sleep(100);
+
+  // (3) A restarts: a NEW process equivalent (new DocClient, same dir)
+  // restores its local Y.Doc from disk, rejoins with the saved state vector
+  // and drains the outbox in saved order.
+  const a2 = mkA();
+  assert.equal(a2.text, 'A-offline', 'local document restored after restart');
+  await a2.connect(); // auto-presents restored SV; auto-drain fires
+  let conv = await settleConvergence([a2, b], 't11');
+  // Both offline and online edits survive; relative order of concurrent
+  // position-0 inserts is a Yjs client-id tie-break, not asserted here.
+  assert.ok(conv.text.includes('A-offline') && conv.text.includes('B-online'),
+    `both sides must merge, got ${conv.text}`);
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), 2, 'one B row + one A row');
+  assert.equal(fs.existsSync(boxFile) ? JSON.parse(fs.readFileSync(boxFile, 'utf8')).items.length : 0,
+    0, 'acked item removed from outbox');
+
+  // (4) A sends one more update and HARD-EXITS before the ack arrives.
+  a2.localEdit((t) => t.insert(t.length, '+crashack'));
+  const item = a2.outbox.outstanding()[0];
+  const crashMsgId = item.msgId;
+  a2.ws.send(JSON.stringify({ type: 'update', msgId: crashMsgId, update: item.update }));
+  a2.ws.terminate(); // no ack processed; simulates process kill
+  // Wait until the server either committed (or not) — both are legal at the
+  // boundary, the retry must end in exactly one row regardless.
+  const deadline = Date.now() + 3000;
+  let committed = 0;
+  while (Date.now() < deadline) {
+    committed = (await db.query(
+      `SELECT count(*)::int AS n FROM doc_updates WHERE doc_id='t11' AND client_msg_id=$1`,
+      [crashMsgId],
+    )).rows[0].n;
+    if (committed > 0) break;
+    await sleep(30);
+  }
+
+  // (5) Restart A again: restored state + state-vector hello + ordered
+  // resend. The server dedups on (doc_id, client_msg_id): ONE row only.
+  const a3 = mkA();
+  const box3 = JSON.parse(fs.readFileSync(boxFile, 'utf8'));
+  assert.deepEqual(box3.items.map((i) => i.msgId), [crashMsgId]);
+  await a3.connect();
+  const rep = await a3.drainOutbox();
+  assert.equal(rep.sent, 1);
+  assert.equal(rep.acked, 1);
+  assert.equal(rep.failed, 0);
+  assert.equal(rep.duplicated, committed > 0 ? 1 : 0,
+    `duplicated flag must match whether the server had committed before the retry: ${JSON.stringify(rep)}`);
+
+  const rows = (await db.query(
+    `SELECT seq FROM doc_updates WHERE doc_id='t11' AND client_msg_id=$1`,
+    [crashMsgId],
+  )).rows;
+  assert.equal(rows.length, 1, 'unacked update resent produces exactly ONE server update');
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), 3);
+
+  const fresh = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  await fresh.connect();
+  conv = await settleConvergence([a3, b, fresh], 't11');
+  assert.ok(conv.text.endsWith('+crashack'), `crash-ack edit must merge, got ${conv.text}`);
+  assert.ok(conv.text.includes('A-offline') && conv.text.includes('B-online'));
+
+  // The offline-only msgId was never sent again after its ack.
+  const offlineRows = (await db.query(
+    `SELECT count(*)::int AS n FROM doc_updates WHERE doc_id='t11' AND client_msg_id=$1`,
+    [offlineMsgId],
+  )).rows[0].n;
+  assert.equal(offlineRows, 1);
+  a3.close(); b.close(); fresh.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// T12 outbox failures (reader / revoked) are retained with the error
+// ---------------------------------------------------------------------------
+const t12 = test('T12 outbox keeps failed items with READ_ONLY/FORBIDDEN errors instead of silently clearing them', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { keyFor } = require('../scripts/outbox');
+  await createDoc('t12', { writers: ['user-alice'], readers: ['user-carol'] });
+
+  // --- reader: hello succeeds, every write is nacked READ_ONLY ---
+  const dirR = fs.mkdtempSync(path.join(os.tmpdir(), 'outbox-t12r-'));
+  const reader = new DocClient({
+    url: WS_URL, token: 'user-carol', docId: 't12', outboxDir: dirR,
+  });
+  await reader.connect();
+  assert.equal(reader.role, 'reader');
+  reader.localEdit((t) => t.insert(0, 'r1'));
+  reader.localEdit((t) => t.insert(t.length, 'r2'));
+  const rep1 = await reader.drainOutbox();
+  assert.equal(rep1.sent, 2);
+  assert.equal(rep1.acked, 0);
+  assert.equal(rep1.failed, 2);
+  assert.deepEqual(rep1.results.map((r) => r.code), ['READ_ONLY', 'READ_ONLY']);
+
+  const fR = path.join(dirR, keyFor('user-carol', 't12'));
+  let disk = JSON.parse(fs.readFileSync(fR, 'utf8'));
+  assert.equal(disk.items.length, 2, 'failed items retained on disk');
+  assert.ok(disk.items.every((i) => i.status === 'error' && i.lastError.code === 'READ_ONLY'),
+    'error code persisted with each item');
+  // Saved order is preserved across the failed drain.
+  assert.ok(disk.items[0].seq < disk.items[1].seq);
+
+  // Restart and drain again: same items, same rejection, error refreshed;
+  // nothing vanishes and nothing lands in the database.
+  reader.hardClose();
+  await sleep(100);
+  const reader2 = new DocClient({
+    url: WS_URL, token: 'user-carol', docId: 't12', outboxDir: dirR,
+  });
+  await reader2.connect();
+  const rep2 = await reader2.drainOutbox();
+  assert.equal(rep2.sent, 2);
+  assert.equal(rep2.failed, 2);
+  disk = JSON.parse(fs.readFileSync(fR, 'utf8'));
+  assert.equal(disk.items.length, 2);
+  assert.ok(disk.items.every((i) => i.lastError.code === 'READ_ONLY'));
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t12'`), 0, 'reader writes never persist');
+
+  // --- revoked writer: FORBIDDEN items are retained the same way ---
+  const dirW = fs.mkdtempSync(path.join(os.tmpdir(), 'outbox-t12w-'));
+  const alice = new DocClient({
+    url: WS_URL, token: 'user-alice', docId: 't12', outboxDir: dirW,
+  });
+  await alice.connect();
+  alice.localEdit((t) => t.insert(0, 'before'));
+  await alice.drainOutbox();
+  await db.query(
+    `UPDATE document_members SET revoked_at=now() WHERE doc_id='t12' AND user_id='user-alice'`,
+  );
+  alice.localEdit((t) => t.insert(0, 'after-revoke'));
+  const rep3 = await alice.drainOutbox();
+  assert.equal(rep3.failed, 1);
+  assert.equal(rep3.results[0].code, 'FORBIDDEN');
+  const fW = path.join(dirW, keyFor('user-alice', 't12'));
+  const diskW = JSON.parse(fs.readFileSync(fW, 'utf8'));
+  assert.equal(diskW.items.length, 1);
+  assert.equal(diskW.items[0].lastError.code, 'FORBIDDEN');
+
+  reader2.close(); alice.close();
+  fs.rmSync(dirR, { recursive: true, force: true });
+  fs.rmSync(dirW, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

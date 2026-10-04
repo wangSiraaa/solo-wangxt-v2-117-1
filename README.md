@@ -7,7 +7,12 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
 哈希**断言一致，而不是只看渲染出的字符串。
 
 无前端。`scripts/client-a.js` / `scripts/client-b.js` 是两个脚本客户端，用于
-演示并发编辑、乱序、删除与重连。
+演示并发编辑、乱序、删除与重连。两者都带一个**可选的本地离线投递箱**
+（`scripts/outbox.js`，默认启用，目录 `.outbox/`）：本地编辑在帧发出前先落
+本地文件，记录文档身份、稳定 `msgId`、Yjs 更新字节与待发状态，以及完整本地
+Y.Doc 状态；只有收到 `ack {ok:true}`（含 `duplicated:true` 去重命中）才移除。
+重启后用保存的状态向量先做 hello 差异同步，再按保存顺序重发；失败项
+（`READ_ONLY`/`FORBIDDEN` 等）保留错误提示，不会被静默清空。
 
 ---
 
@@ -43,7 +48,8 @@ HTTP/WebSocket，PostgreSQL 保存只增的更新日志与压缩快照。不存�
 * 客户端本地 Y.Doc 已有该编辑，重连同一份更新是幂等合并。
 
 这个边界不是纸面约定——见测试 T4（`CRASH_AFTER_COMMIT=1` 时进程在 COMMIT 后
-直接 `exit(17)`）与 T10（正常 SIGTERM 重启后重连收敛）。
+直接 `exit(17)`）与 T10（正常 SIGTERM 重启后重连收敛）。客户端侧的镜像实现
+是本地离线投递箱（T11/T12）：编辑先落本地文件，只有成功 ack 才删除。
 
 ### 去重
 
@@ -159,6 +165,30 @@ curl -s -H 'x-auth-token: user-owner' \
   http://127.0.0.1:7777/v1/docs/doc-demo/recovered-state
 ```
 
+### 离线投递箱演示（`DEMO_SCENARIO`）
+
+```bash
+# 1) A 完全离线编辑（不连接服务端），编辑已落本地投递箱
+DEMO_SCENARIO=offline OFFLINE_PHASE=1 npm run demo:a
+# 2) B 在 A 离线期间在线编辑
+npm run demo:b
+# 3) A 重启：先用保存的状态向量补齐差异，再按顺序重发；三方哈希收敛
+DEMO_SCENARIO=offline OFFLINE_PHASE=2 npm run demo:a
+
+# A 发出更新后、未收到 ack 前立即退出（模拟 SIGKILL），重启重发同一 msgId：
+DEMO_SCENARIO=crash-ack CRASH_PHASE=1 npm run demo:a
+DEMO_SCENARIO=crash-ack CRASH_PHASE=2 npm run demo:a   # 打印 server_rows=1（服务端去重）
+
+# reader 的写帧永远被 READ_ONLY 拒绝；失败项带错误保留在投递箱中：
+TOKEN_B=user-carol DEMO_SCENARIO=reader npm run demo:b
+
+DEMO_SCENARIO=status npm run demo:a     # 只查看本地投递箱
+DEMO_SCENARIO=reset  npm run demo:a     # 删除该 (user, doc) 的本地文件
+```
+
+环境变量：`OUTBOX_DIR`（默认 `.outbox/`）、`DOC_ID`、`TOKEN_A`/`TOKEN_B`、
+`EXIT_DELAY_MS`。投递箱按 `(token, docId)` 分文件，原子写（tmp+rename）。
+
 种子身份（demo 用，用户 id 即 bearer token）：
 
 | 用户 | 租户 | 对 doc-demo 的角色 |
@@ -191,6 +221,8 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 本地离线投递箱：离线编辑落盘；B 在线编辑后 A 重启（新进程）恢复本地文档、SV 差异同步、按序重发，A/B/PostgreSQL 哈希收敛；A 发出更新未收 ack 即退出，重启用同一 `msgId` 重发，服务端恰好一行（`duplicated` 与提交时机一致） |
+| T12 | reader 的 `READ_ONLY` 与被撤权者的 `FORBIDDEN` 失败项保留在投递箱、带错误码与保存顺序，重启重发仍失败也不清空，且无任何 reader 写入落库 |
 
 ---
 
@@ -209,8 +241,9 @@ src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
 src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
 scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
-scripts/client-a.js      演示客户端 A
-scripts/client-b.js      演示客户端 B
+scripts/outbox.js        可选本地离线投递箱（文档身份/msgId/字节/状态 + 本地 Y.Doc 快照）
+scripts/client-a.js      演示客户端 A（normal/offline/crash-ack/status/reset）
+scripts/client-b.js      演示客户端 B（online/offline/reader，reader 展示失败项保留）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```
