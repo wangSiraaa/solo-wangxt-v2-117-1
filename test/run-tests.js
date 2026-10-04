@@ -10,6 +10,8 @@
 const { spawn } = require('node:child_process');
 const http = require('node:http');
 const path = require('node:path');
+const fs = require('node:fs');
+const os = require('node:os');
 const assert = require('node:assert/strict');
 const Y = require('yjs');
 const crypto = require('node:crypto');
@@ -690,13 +692,190 @@ const t10 = test('T10 normal restart after persisted traffic: reconnecting clien
 });
 
 // ---------------------------------------------------------------------------
+// T11 offline outbox: offline edits survive a restart and converge after
+// state-vector sync + ordered resend
+// ---------------------------------------------------------------------------
+function outboxFile(name) {
+  const file = path.join(os.tmpdir(), 'collab-outbox-tests', `${name}.json`);
+  fs.rmSync(file, { force: true });
+  return file;
+}
+
+const t11 = test('T11 offline outbox: offline edits resend after reconnect and converge', async () => {
+  await createDoc('t11', { writers: ['user-alice', 'user-bob'] });
+  const file = outboxFile('t11-a');
+
+  // Phase 1: A online, one acked edit, then a hard disconnect.
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11', outboxFile: file });
+  await a.connect();
+  a.localEdit((t) => t.insert(0, 'A1 '));
+  await a.flush();
+  assert.deepEqual(a.outboxCounts(), { pending: 0, failed: 0, total: 0 });
+  a.hardClose();
+  await sleep(150);
+
+  // Phase 2: A edits while offline. The items land in the outbox only.
+  a.localEdit((t) => t.insert(t.length, 'A-off1 '));
+  a.localEdit((t) => t.insert(t.length, 'A-off2 '));
+  assert.equal(a.outboxCounts().pending, 2);
+  // The process "exits": the client object is dropped, the file persists.
+
+  // Phase 3: B edits online while A is gone.
+  const b = new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11' });
+  await b.connect();
+  b.localEdit((t) => t.insert(t.length, 'B-online '));
+  await b.flush();
+  await sleep(100);
+
+  // Phase 4: A restarts — a brand-new client over the same outbox file.
+  const a2 = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't11', outboxFile: file });
+  assert.equal(a2.outboxCounts().pending, 2, 'un-acked items restored');
+  assert.ok(a2.text.includes('A-off1') && a2.text.includes('A-off2'),
+    'local document restored including un-acked edits');
+  assert.ok(!a2.text.includes('B-online'), 'B edit not known yet');
+
+  // Identity guard: the same file under another user/doc must refuse loudly.
+  assert.throws(
+    () => new DocClient({ url: WS_URL, token: 'user-bob', docId: 't11', outboxFile: file }),
+    /identity mismatch/,
+  );
+
+  // Reconnect: state-vector sync first (pulls B's edit), then ordered resend.
+  await a2.reconnectWithStateVector();
+  assert.ok(a2.text.includes('B-online'), 'SV sync delivered the offline gap');
+  const results = await a2.flush();
+  assert.equal(results.length, 2);
+  assert.ok(results.every((r) => r.ok), 'both saved items acked');
+  assert.equal(a2.outboxCounts().total, 0, 'outbox drained after acks');
+
+  // A, B and a PostgreSQL-only rebuild converge structurally.
+  const conv = await settleConvergence([a2, b], 't11');
+  for (const marker of ['A1', 'A-off1', 'A-off2', 'B-online']) {
+    assert.ok(conv.text.includes(marker), `missing ${marker} in ${conv.text}`);
+  }
+  assert.equal(await sqlCount('doc_updates', `WHERE doc_id='t11'`), 4);
+  a2.close(); b.close();
+});
+
+// ---------------------------------------------------------------------------
+// T12 offline outbox across the commit/ack crash boundary: a restart resend
+// hits server-side dedup and produces exactly one persisted update
+// ---------------------------------------------------------------------------
+const t12 = test('T12 outbox resend after crash-before-ack dedups to a single server update', async () => {
+  await startServer({ crashAfterCommit: true });
+  await createDoc('t12', { writers: ['user-alice'] });
+  const file = outboxFile('t12-a');
+
+  const a = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't12', outboxFile: file });
+  await a.connect();
+  a.localEdit((t) => t.insert(0, 'BOUNDARY'));
+  const exitP = new Promise((res) => serverProc.on('exit', (code) => res(code)));
+  // The server commits then exits(17) before the ack; the send times out
+  // and the item stays pending in the outbox.
+  await a.flush({ timeoutMs: 1500 });
+  assert.equal(String(await exitP), '17');
+  assert.equal(a.outboxCounts().pending, 1, 'no ack -> item stays pending');
+  const savedMsgId = a.outbox.items[0].msgId;
+  // Process "exits" here; only the outbox file survives.
+
+  await startServer({ crashAfterCommit: false });
+
+  const a2 = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't12', outboxFile: file });
+  assert.equal(a2.outboxCounts().pending, 1);
+  assert.equal(a2.text, 'BOUNDARY', 'local doc restored with the un-acked edit');
+  await a2.reconnectWithStateVector();
+  const results = await a2.flush();
+  assert.equal(results.length, 1);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[0].msgId, savedMsgId, 'stable msgId reused across restart');
+  assert.equal(results[0].duplicated, true, 'server dedup: already durable');
+  assert.equal(a2.outboxCounts().total, 0, 'ack-gated removal');
+
+  // Exactly one server-side update exists for the resent item.
+  const rows = (await db.query(
+    `SELECT seq, client_msg_id FROM doc_updates WHERE doc_id='t12'`,
+  )).rows;
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].client_msg_id, savedMsgId);
+
+  // On disk the outbox is empty; the recovered store matches the client.
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(onDisk.items.length, 0);
+  const r = await rebuildAndHash('t12');
+  assert.equal(r.hash, a2.stateHash());
+  a2.close();
+});
+
+// ---------------------------------------------------------------------------
+// T13 offline outbox: nacked items (reader / revoked writer) are retained
+// with their error — never silently cleared — and retry once rights return
+// ---------------------------------------------------------------------------
+const t13 = test('T13 outbox keeps failed items with errors; retry succeeds after re-grant', async () => {
+  await createDoc('t13', { writers: ['user-alice'], readers: ['user-carol'] });
+  const fileCarol = outboxFile('t13-carol');
+  const fileAlice = outboxFile('t13-alice');
+
+  // Reader Carol: the write is nacked READ_ONLY and must stay in the outbox.
+  const c = new DocClient({ url: WS_URL, token: 'user-carol', docId: 't13', outboxFile: fileCarol });
+  await c.connect();
+  assert.equal(c.role, 'reader');
+  c.localEdit((t) => t.insert(0, 'carol-write'));
+  const rc = await c.flush();
+  assert.equal(rc[0].ok, false);
+  assert.equal(rc[0].code, 'READ_ONLY');
+  assert.deepEqual(c.outboxCounts(), { pending: 0, failed: 1, total: 1 });
+
+  // Across a "restart" the failed item and its error are still there.
+  const c2 = new DocClient({ url: WS_URL, token: 'user-carol', docId: 't13', outboxFile: fileCarol });
+  assert.equal(c2.outboxCounts().failed, 1, 'failed item survives restart');
+  assert.equal(c2.outbox.items[0].error.code, 'READ_ONLY');
+  assert.match(c2.outbox.items[0].error.message, /reader/);
+
+  // Writer Alice: membership revoked before the flush -> FORBIDDEN nack.
+  const al = new DocClient({ url: WS_URL, token: 'user-alice', docId: 't13', outboxFile: fileAlice });
+  await al.connect();
+  await db.query(
+    `UPDATE document_members SET revoked_at=now() WHERE doc_id='t13' AND user_id='user-alice'`,
+  );
+  al.localEdit((t) => t.insert(0, 'alice-after-revoke'));
+  const ra = await al.flush();
+  assert.equal(ra[0].ok, false);
+  assert.equal(ra[0].code, 'FORBIDDEN');
+  assert.equal(al.outboxCounts().failed, 1);
+
+  // Not silently cleared: the file on disk still holds the item + error,
+  // and the rejected edit never reached the server-side document.
+  const onDisk = JSON.parse(fs.readFileSync(fileAlice, 'utf8'));
+  assert.equal(onDisk.items.length, 1);
+  assert.equal(onDisk.items[0].status, 'failed');
+  assert.equal(onDisk.items[0].error.code, 'FORBIDDEN');
+  const denied = await rebuildAndHash('t13');
+  assert.equal(denied.text, '');
+
+  // Rights restored: the very same item (stable msgId) retries and drains.
+  await db.query(
+    `UPDATE document_members SET revoked_at=NULL WHERE doc_id='t13' AND user_id='user-alice'`,
+  );
+  const ra2 = await al.flush();
+  assert.equal(ra2[0].ok, true);
+  assert.equal(ra2[0].msgId, onDisk.items[0].msgId);
+  assert.deepEqual(al.outboxCounts(), { pending: 0, failed: 0, total: 0 });
+  const granted = await rebuildAndHash('t13');
+  assert.equal(granted.text, 'alice-after-revoke');
+
+  // Carol is still a reader: her failed item remains, error intact.
+  assert.equal(c2.outboxCounts().failed, 1);
+  c.close(); c2.close(); al.close();
+});
+
+// ---------------------------------------------------------------------------
 // runner
 // ---------------------------------------------------------------------------
 async function main() {
   await setupTest();
   await startServer({ crashAfterCommit: false });
 
-  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10];
+  const tests = [t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13];
   let pass = 0;
   const failures = [];
   for (const t of tests) {

@@ -7,13 +7,14 @@
 const WebSocket = require('ws');
 const Y = require('yjs');
 const crypto = require('node:crypto');
+const { Outbox } = require('./lib-outbox');
 
 function newMsgId() {
   return crypto.randomBytes(8).toString('hex');
 }
 
 class DocClient {
-  constructor({ url, token, docId, name, autoApply = true, verbose = false }) {
+  constructor({ url, token, docId, name, autoApply = true, verbose = false, outboxFile = null }) {
     this.url = url;
     this.token = token;
     this.docId = docId;
@@ -22,6 +23,18 @@ class DocClient {
     this.verbose = verbose;
 
     this.doc = new Y.Doc({ gc: false });
+    // Optional local offline outbox: restores the local document (including
+    // un-acked edits) and the stable client identity from disk. Entirely
+    // opt-in; without outboxFile the client behaves exactly as before.
+    this.outbox = null;
+    if (outboxFile) {
+      this.outbox = new Outbox(outboxFile, { docId, token });
+      const restored = this.outbox.load();
+      if (restored && restored.docState && restored.docState.length) {
+        Y.applyUpdate(this.doc, new Uint8Array(restored.docState), 'outbox-restore');
+      }
+      this.outbox.attachDoc(this.doc);
+    }
     this.ws = null;
     this.seq = 0;
     this.connected = false;
@@ -145,6 +158,7 @@ class DocClient {
             this.pending.delete(msg.msgId);
             const e = new Error(`${msg.code}: ${msg.message}`);
             e.code = msg.code;
+            e.serverMessage = msg.message;
             p.reject(e);
           }
           this.errors.push([msg.code, msg.message]);
@@ -195,17 +209,26 @@ class DocClient {
     } finally {
       this.doc.off('update', handler);
     }
-    if (updateB64) this.updateQueue.push(updateB64);
+    if (updateB64) {
+      if (this.outbox) {
+        // Stable msgId assigned at enqueue time; persisted before any send.
+        this.outbox.enqueue(newMsgId(), updateB64);
+      } else {
+        this.updateQueue.push(updateB64);
+      }
+    }
     return updateB64;
   }
 
   queueUpdate(updateB64) {
-    this.updateQueue.push(updateB64);
+    if (this.outbox) this.outbox.enqueue(newMsgId(), updateB64);
+    else this.updateQueue.push(updateB64);
   }
 
   // Flush queued updates with a deterministic ordering function.
   // orderFn(queue) returns the sequence of b64 strings to send.
   async flush({ orderFn = null, concurrent = false, timeoutMs = 5000 } = {}) {
+    if (this.outbox) return this.flushOutbox({ timeoutMs });
     const items = orderFn ? orderFn(this.updateQueue) : this.updateQueue.slice();
     this.updateQueue = [];
     const sends = items.map((b64) => () => this.sendUpdate(b64, timeoutMs));
@@ -216,6 +239,40 @@ class DocClient {
     const out = [];
     for (const s of sends) out.push(await s());
     return out;
+  }
+
+  // Outbox flush: (re)send every un-acked item in saved order, each with
+  // its stable msgId. An item is removed only on ack { ok: true } (a
+  // `duplicated` ack counts — the row is already durable server-side).
+  // A server nack marks the item failed and keeps it with the error;
+  // transport failures (no connection, ack timeout) leave it pending.
+  async flushOutbox({ timeoutMs = 5000 } = {}) {
+    if (!this.connected || !this.helloDone) {
+      return this.outbox.items.map((it) => ({
+        msgId: it.msgId, ok: false, code: 'OFFLINE',
+        message: 'not connected; item stays in outbox',
+      }));
+    }
+    const results = [];
+    for (const item of this.outbox.items.slice()) {
+      this.outbox.noteAttempt(item.msgId);
+      try {
+        const ack = await this.sendUpdate(item.update, timeoutMs, item.msgId);
+        this.outbox.markAcked(item.msgId);
+        results.push(ack);
+      } catch (e) {
+        if (e.code) this.outbox.markFailed(item.msgId, e.code, e.serverMessage || e.message);
+        results.push({
+          msgId: item.msgId, ok: false,
+          code: e.code || 'NO_ACK', message: e.serverMessage || e.message,
+        });
+      }
+    }
+    return results;
+  }
+
+  outboxCounts() {
+    return this.outbox ? this.outbox.counts() : null;
   }
 
   sendUpdate(updateB64, timeoutMs = 5000, msgId = newMsgId()) {

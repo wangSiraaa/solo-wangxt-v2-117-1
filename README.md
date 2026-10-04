@@ -63,6 +63,31 @@ hello 和 `sync-req` 都接受 Yjs 状态向量：服务器返回
 `encodeStateAsUpdate(doc, sv)`——只包含缺失结构体的差异，而不是强制全量。
 当前 SV 的差异编码为空；把旧差异再应用一次是幂等的（T5）。
 
+### 客户端本地离线投递箱（可选）
+
+脚本客户端可以把「未确认」的责任从内存搬到本地文件
+（`scripts/lib-outbox.js`，演示客户端默认开启，`OUTBOX=off` 关闭，
+`OUTBOX_FILE` 指定路径）。每个客户端一个 JSON 文件，记录：
+
+* **文档身份**：`docId` + `token`。加载时校验，身份不符直接报错，
+  不会把一个文档的状态静默套到另一个文档上；
+* **本地文档态**：稳定的 Yjs `clientID` + 全量状态编码，重启后恢复本地
+  文档（含未确认编辑），新编辑延续原 client 时钟；
+* **待发项**（按保存顺序）：`msgId`（入队时分配一次、跨重启稳定）、
+  Yjs 更新字节、状态（`pending` / `failed` + 服务端错误码与消息）。
+
+重连顺序固定：**先**带状态向量 hello（只补差异），**再**按保存顺序重发
+投递箱条目。删除以 ack 为闸门：只有 `ack {ok:true}`（含
+`duplicated:true`——说明服务端早已持久化，命中 `(doc_id, client_msg_id)`
+去重）才把条目移出投递箱。服务端 nack（如 `READ_ONLY`/`FORBIDDEN`）会把
+条目标记为 `failed` 并记录错误，**保留在投递箱中**，下次 flush 会重试；
+传输层失败（断线、ack 超时）则维持 `pending`。进程在 ack 前退出时，条目
+随文件幸存，重启后以同一 `msgId` 重发，服务端只落一行（T12）。
+
+文件写入为「临时文件 + rename」的原子同步写，崩溃不会留下半写的文件。
+演示：`node scripts/client-a.js --offline` 不连接直接离线编辑并退出
+（待发数 +1），随后正常运行 `client-a.js` 即恢复、同步、按序重发。
+
 ### 压缩后仍可恢复
 
 `POST /v1/docs/:docId/compact` 在该文档的串行队列内执行：
@@ -191,6 +216,9 @@ npm test
 | T8 | 非成员、跨租户、未知 token、reader 写、会话中途撤销权限、HTTP 端点越权全部被拒 |
 | T9 | 3 客户端 60 个最大并发的插入/删除，收敛到同一哈希；日志恰好 61 行，无丢失/重复 |
 | T10 | 正常 SIGTERM 重启后，旧 SV 重连与冷副本全量加入都与重启前哈希一致，且不重复落库 |
+| T11 | 离线投递箱：A 断线离线编辑 → B 在线编辑 → A 重启恢复本地文档与待发项，SV 同步后按序重发，A/B/PostgreSQL 重建三方收敛 |
+| T12 | ack 前进程退出：投递箱条目随文件幸存，重启以同一 `msgId` 重发命中去重，服务端恰好一行 |
+| T13 | reader / 被撤权者的失败项带错误码保留在投递箱（重启后仍在），不静默清空；恢复权限后同一条目重试成功并清空 |
 
 ---
 
@@ -208,9 +236,10 @@ src/compaction.js        压缩、双重一致性校验、存储恢复
 src/errorlog.js          update_errors 落库
 src/ws.js                WebSocket 协议
 src/server.js            Fastify 入口 + 管理/恢复 HTTP 端点
-scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连）
-scripts/client-a.js      演示客户端 A
-scripts/client-b.js      演示客户端 B
+scripts/lib-client.js    可控脚本客户端（手动 flush、乱序、重发、硬断线、带 SV 重连、可选离线投递箱）
+scripts/lib-outbox.js    本地离线投递箱（身份校验、稳定 msgId、ack 闸门删除、失败保留）
+scripts/client-a.js      演示客户端 A（--offline 离线编辑；启动显示待发数，重连后按序重发）
+scripts/client-b.js      演示客户端 B（同样展示待发数与重连结果）
 scripts/seed.js          demo 租户/用户/文档/成员
 test/                    端到端收敛与持久化测试
 ```

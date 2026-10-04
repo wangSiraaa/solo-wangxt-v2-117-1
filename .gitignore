@@ -18,6 +18,7 @@ id_ed25519
 *.p12
 *.pfx
 node_modules/
+scripts/.outbox/
 .venv/
 venv/
 __pycache__/
@@ -42,6 +43,7 @@ id_ed25519
 *.p12
 *.pfx
 node_modules/
+scripts/.outbox/
 .venv/
 venv/
 __pycache__/
